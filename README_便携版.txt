@@ -20,6 +20,6 @@
 - 仅支持 64 位 Windows（打包机为 Windows x64）。若目标电脑是 ARM 版 Windows，
   需在同一架构的机器上重新打包。
 
-【如何自己重新打包】（可选，仅在打包机需要）
+【如何自己重新打包】（可选，仅在打包机需要）s
 前置：pip install pyinstaller yt-dlp imageio-ffmpeg
 双击  build.bat  即可，生成的便携包在 dist\VideoDownloader\ 。

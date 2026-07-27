@@ -109,8 +109,8 @@ class ProgressReporter:
             self.callback(d)
 
 
-def _cli_status(d: dict):
-    """CLI 模式下的进度打印（输出到 stderr，不污染 stdout 的 JSON）。"""
+def _cli_status(url: str, d: dict):
+    """CLI 模式下的进度打印（输出到 stderr，不污染 stdout 的 JSON）。url 参数被忽略。"""
     if d.get("status") == "downloading":
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         downloaded = d.get("downloaded_bytes", 0)
@@ -199,7 +199,9 @@ def download_one(url: str, progress_callback=None, **opts_kwargs) -> dict:
         # 同时注入进程环境变量，确保 ffmpeg 子进程（m3u8 分片）也走代理
         os.environ["HTTP_PROXY"] = proxy
         os.environ["HTTPS_PROXY"] = proxy
-    opts = build_ydl_opts(progress_callback=progress_callback, **opts_kwargs)
+    # 把 url 一并交给回调，便于上层（GUI）按任务区分进度
+    cb = (lambda d: progress_callback(url, d)) if progress_callback else None
+    opts = build_ydl_opts(progress_callback=cb, **opts_kwargs)
     simulate = opts.get("simulate", False)
     with YoutubeDL(opts) as ydl:
         try:
