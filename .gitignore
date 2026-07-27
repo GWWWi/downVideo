@@ -18,3 +18,6 @@ downloads/
 # ===== 系统 =====
 .DS_Store
 Thumbs.db
+
+# ===== 打包产物 zip（作为 GitHub Release 上传，不入库） =====
+VideoDownloader-portable-*.zip
