@@ -1,0 +1,6 @@
+# 每行一个视频链接，# 开头为注释
+# 支持的站点（yt-dlp 支持 1000+）：YouTube / X(Twitter) / Pornhub / Bilibili / TikTok / Vimeo / Facebook ...
+
+# https://www.youtube.com/watch?v=dQw4w9WgXcQ
+# https://twitter.com/xxx/status/1234567890
+# https://www.pornhub.com/view_video.php?viewkey=xxxxxxxx
