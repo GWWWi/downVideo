@@ -193,6 +193,7 @@ class App:
 
         self._append("就绪。粘贴链接后点击「开始下载」。\n")
         self._append("提示: 点「检测分辨率」可获取该视频真实可选清晰度；X / Pornhub 等建议先选「Cookie 浏览器」。\n")
+        self._append("注意: 任何下载 / 检测失败，完整报错都会显示在下方的「日志」窗口（exe 双击运行时也可看同目录 downloader.log）。\n")
 
         # 关闭窗口时若有待执行关机，先取消
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -349,11 +350,13 @@ class App:
         try:
             results = download_batch(
                 urls, threads=threads, progress_callback=cb,
+                # 每个任务失败实时写进日志窗口（✅/❌ 也回显到日志，便于排查）
+                error_callback=lambda m: self.root.after(0, self._append, f"\u274c {m}\n"),
                 output_dir=out, quality=sel,
                 cookies_browser=(browser if browser != "\u65e0" else None),
                 cookies_file=(cookie if cookie else None),
                 proxy=(proxy or None),
-                quiet=True,  # windowed 模式下不向 None 流输出；进度由回调展示，错误写入 downloader.log
+                quiet=True,  # windowed 模式下不向 None 流输出；进度由回调展示，错误写入 downloader.log 与日志窗口
             )
         except Exception as e:
             self.root.after(0, self._append, f"\ud83d\udca5 异常: {e}\n")
@@ -417,7 +420,14 @@ class App:
 
     def _on_all_done(self, ok, total):
         self.download_btn.config(state="normal")
-        self._append(f"\n\u2705 完成：成功 {ok}/{total}\n")
+        self.log_box.see(tk.END)
+        if ok < total:
+            self._append(
+                f"\n\u26a0\ufe0f 完成：成功 {ok}/{total}，有 {total - ok} 个任务失败，"
+                f"详细报错见上方日志（windowed 模式下也可查看同目录 downloader.log）。\n"
+            )
+        else:
+            self._append(f"\n\u2705 完成：成功 {ok}/{total}\n")
         if self.shutdown_var.get():
             self._schedule_shutdown(self.delay_var.get())
 

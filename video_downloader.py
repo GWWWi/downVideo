@@ -40,12 +40,20 @@ try:
 except Exception:  # pragma: no cover
     imageio_ffmpeg = None
 
+_WINDOWED = False  # 是否处于无控制台（windowed exe）模式，_ensure_streams 中设置
+_NODE_CACHE = None   # find_node_exe 结果缓存，避免每次构建选项都启动 node --version
+_DENO_CACHE = None   # find_deno_exe 结果缓存
+_JS_RT_CACHE = None  # find_js_runtime 结果缓存：(name, path)
+
+
 def _ensure_streams():
     """windowed（无控制台）模式下 sys.stdout / sys.stderr 为 None，
     任何 .write() 调用都会抛 'NoneType' object has no attribute 'write'。
     此处替换为安全的写日志流（写文件、不崩溃），有控制台时保持不变。"""
+    global _WINDOWED
     if sys.stdout is not None and sys.stderr is not None:
         return
+    _WINDOWED = True
 
     # 日志写在与脚本/EXE 同目录的 downloader.log，便于排查真实下载错误
     try:
@@ -247,26 +255,161 @@ def _resolve_cookiefile(cookies_file: str | None) -> str | None:
     return tmp
 
 
-def ensure_node_on_path():
-    """yt-dlp 新版需要用 node 解 YouTube 的 n/nsig 反爬挑战。
+def find_node_exe() -> str | None:
+    """定位 node 可执行文件，返回绝对路径（找不到返回 None）。
 
-    若当前 PATH 找不到 node，则尝试把 WorkBuddy 自带的 node 加进 PATH，
-    让打包后的 exe 也能正常解出视频格式（否则只会拿到 storyboard 缩略图，
-    并伴随 'n challenge solving failed' 警告）。"""
-    if shutil.which("node"):
-        return
+    yt-dlp 新版需要 JS 运行时解 YouTube 的 n/nsig 反爬挑战。不同 node 版本
+    兼容性不同：实测 yt-dlp 2026.7.4 把 node 20.x 标记为 "unsupported"，
+    而 node 22.x 才能正常解出真实格式（否则 "n challenge solving failed"，
+    只能拿到 sb0~sb3 缩略图 → "Requested format is not available"）。
+    因此这里在所有候选里挑**版本最高**的 node，避免挑到不被支持的旧版本。
+    结果带缓存（_NODE_CACHE），避免每次构建下载选项都启动一次 node --version。"""
+    global _NODE_CACHE
+    if _NODE_CACHE is not None:
+        return _NODE_CACHE
     import glob
+    import re
+    import subprocess
 
     patterns = (
+        # WorkBuddy 自带 node（22.x，已验证可解 n 挑战）优先纳入候选
         os.path.expanduser("~/.workbuddy/binaries/node/versions/*/node.exe"),
         "C:/Users/*/.workbuddy/binaries/node/versions/*/node.exe",
+        "C:/Program Files/nodejs/node.exe",
+        "C:/Program Files (x86)/nodejs/node.exe",
+        os.path.expanduser("~/AppData/Local/Programs/nodejs/node.exe"),
+        os.path.expanduser("~/scoop/apps/nodejs*/current/node.exe"),
+        os.path.expanduser("~/AppData/Roaming/nvm/*/node.exe"),
     )
+    candidates: list[str] = []
+    which_hit = shutil.which("node")  # 可能返回不受支持的旧 node（如 nvm4w 的 20.x）
+    if which_hit:
+        candidates.append(which_hit)
     for pat in patterns:
-        hits = sorted(glob.glob(pat), reverse=True)
-        if hits:
-            node_dir = os.path.dirname(hits[0])
-            os.environ["PATH"] = node_dir + os.pathsep + os.environ.get("PATH", "")
-            return
+        candidates.extend(sorted(glob.glob(pat), reverse=True))
+
+    # 去重（保留顺序）
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in candidates:
+        c = os.path.abspath(c)
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            uniq.append(c)
+
+    best = None
+    best_ver = (-1, -1, -1)
+    for c in uniq:
+        if not os.path.isfile(c):
+            continue
+        try:
+            out = subprocess.run(
+                [c, "--version"], capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+            m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+            if not m:
+                continue
+            ver = tuple(int(x) for x in m.groups())
+        except Exception:
+            continue
+        if ver > best_ver:
+            best_ver = ver
+            best = c
+    _NODE_CACHE = best
+    return best
+
+
+def find_deno_exe() -> str | None:
+    """定位 deno 可执行文件，返回绝对路径（找不到返回 None）。
+
+    deno 是 yt-dlp 默认且官方推荐的 JS 运行时，用于解 YouTube 的 n/nsig 挑战。
+    用户本机已装 deno，优先使用它（不再依赖 node）。结果带缓存。"""
+    global _DENO_CACHE
+    if _DENO_CACHE is not None:
+        return _DENO_CACHE
+    import glob
+    import re
+    import subprocess
+
+    patterns = (
+        # 官方安装器默认位置
+        os.path.expanduser("~/.deno/bin/deno"),
+        os.path.expanduser("~/.deno/bin/deno.exe"),
+        "C:/Users/*/.deno/bin/deno",
+        "C:/Users/*/.deno/bin/deno.exe",
+        # scoop
+        os.path.expanduser("~/scoop/shims/deno.exe"),
+        os.path.expanduser("~/scoop/apps/deno/*/deno.exe"),
+        # chocolatey / winget 常见位置
+        "C:/ProgramData/chocolatey/bin/deno.exe",
+        "C:/Program Files/Deno Software/Deno/deno.exe",
+        "C:/Program Files/deno/deno.exe",
+    )
+    candidates: list[str] = []
+    which_hit = shutil.which("deno")
+    if which_hit:
+        candidates.append(which_hit)
+    for pat in patterns:
+        candidates.extend(sorted(glob.glob(pat), reverse=True))
+
+    # 去重（保留顺序）
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in candidates:
+        c = os.path.abspath(c)
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            uniq.append(c)
+
+    best = None
+    best_ver = (-1, -1, -1)
+    for c in uniq:
+        if not os.path.isfile(c):
+            continue
+        try:
+            out = subprocess.run(
+                [c, "--version"], capture_output=True, text=True, timeout=10
+            ).stdout.strip()
+            m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+            if not m:
+                continue
+            ver = tuple(int(x) for x in m.groups())
+        except Exception:
+            continue
+        if ver > best_ver:
+            best_ver = ver
+            best = c
+    _DENO_CACHE = best
+    return best
+
+
+def find_js_runtime():
+    """返回用于解 YouTube n 挑战的 JS 运行时 (name, exe_path)，找不到返回 None。
+
+    优先 deno（用户本机已装），找不到 deno 时才退回 node 兜底。
+    返回绝对路径，避免依赖 PATH。结果带缓存。"""
+    global _JS_RT_CACHE
+    if _JS_RT_CACHE is not None:
+        return _JS_RT_CACHE
+    deno = find_deno_exe()
+    if deno:
+        _JS_RT_CACHE = ("deno", deno)
+        return _JS_RT_CACHE
+    node = find_node_exe()
+    if node:
+        _JS_RT_CACHE = ("node", node)
+        return _JS_RT_CACHE
+    _JS_RT_CACHE = None
+    return None
+
+
+def ensure_js_runtime_on_path():
+    """把所选 JS 运行时所在目录加进 PATH（兜底，通常显式传 path 已足够）。"""
+    rt = find_js_runtime()
+    if rt:
+        rt_dir = os.path.dirname(rt[1])
+        if rt_dir.lower() not in os.environ.get("PATH", "").lower():
+            os.environ["PATH"] = rt_dir + os.pathsep + os.environ.get("PATH", "")
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +427,11 @@ def build_ydl_opts(
     proxy: str | None = None,
     progress_callback=None,
 ) -> dict:
-    ensure_node_on_path()  # 确保 node 在 PATH，供 yt-dlp 解 YouTube n 挑战
+    rt = find_js_runtime()  # 优先 deno，兜底 node；供 yt-dlp 解 YouTube n 挑战
+    if rt:
+        rt_dir = os.path.dirname(rt[1])
+        if rt_dir.lower() not in os.environ.get("PATH", "").lower():
+            os.environ["PATH"] = rt_dir + os.pathsep + os.environ.get("PATH", "")
     ffmpeg = locate_ffmpeg()
     fmt = QUALITY_PRESETS.get(quality, quality)  # 未知串（自定义格式）原样使用
     outtmpl = os.path.join(output_dir, "%(extractor)s", "%(title)s [%(id)s].%(ext)s")
@@ -315,9 +462,16 @@ def build_ydl_opts(
     }
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
-    # yt-dlp 默认启用 deno，若当前只有 node 则必须显式指定，否则 n 挑战求解失败
-    if shutil.which("node"):
-        opts["js_runtimes"] = {"node": {}}
+    # yt-dlp 用 JS 运行时解 YouTube 的 n/nsig 挑战；优先 deno（本机已装），
+    # 显式传绝对路径，不依赖 PATH，否则 n 挑战失败只能解出 storyboard 缩略图（sb0~sb3）
+    if rt:
+        opts["js_runtimes"] = {rt[0]: {"path": rt[1]}}
+    # windowed（无控制台）exe 下开启 verbose，把完整诊断写入 downloader.log，
+    # 便于排查“只有 sb0~sb3 / 格式不可用”这类问题（正常控制台运行不受影响）
+    if _WINDOWED and not print_info:
+        opts["verbose"] = True
+        opts["quiet"] = False
+        opts["no_warnings"] = False
     if no_mtime:
         opts["updatetime"] = False
     if cookies_browser:
@@ -338,7 +492,7 @@ def build_ydl_opts(
 # ---------------------------------------------------------------------------
 # 下载逻辑
 # ---------------------------------------------------------------------------
-def download_one(url: str, progress_callback=None, **opts_kwargs) -> dict:
+def download_one(url: str, progress_callback=None, error_callback=None, **opts_kwargs) -> dict:
     """下载单个 URL，返回视频信息字典。失败抛出 RuntimeError。
 
     若所选画质在该视频上不可用（如年龄限制视频格式受限、地区限制），
@@ -371,8 +525,21 @@ def download_one(url: str, progress_callback=None, **opts_kwargs) -> dict:
                 if "Requested format is not available" in msg and q != "best":
                     last_err = e
                     continue
-                raise RuntimeError(f"下载失败 [{url}]: {e}") from e
-    raise RuntimeError(f"下载失败 [{url}]: 所选画质不可用且回退 best 仍失败: {last_err}") from last_err
+                errmsg = f"下载失败 [{url}]: {e}"
+                # 实时把报错回调出去（GUI 写入日志窗口；CLI 写 stderr）
+                if error_callback:
+                    try:
+                        error_callback(errmsg)
+                    except Exception:
+                        pass
+                raise RuntimeError(errmsg) from e
+    errmsg = f"下载失败 [{url}]: 所选画质不可用且回退 best 仍失败: {last_err}"
+    if error_callback:
+        try:
+            error_callback(errmsg)
+        except Exception:
+            pass
+    raise RuntimeError(errmsg) from last_err
 
 
 def _cleanup_cookiefile(path: str | None):
@@ -386,12 +553,15 @@ def _cleanup_cookiefile(path: str | None):
         pass
 
 
-def download_batch(urls, threads: int = 1, progress_callback=None, **opts_kwargs):
-    """批量下载，返回 [(url, ok, payload)] 列表。单线程逐条，多线程用线程池。"""
+def download_batch(urls, threads: int = 1, progress_callback=None, error_callback=None, **opts_kwargs):
+    """批量下载，返回 [(url, ok, payload)] 列表。单线程逐条，多线程用线程池。
+
+    error_callback(msgstr): 每个任务失败时回调，便于 GUI 实时把报错写进日志窗口。
+    """
     results = []
 
     def _run(u):
-        return download_one(u, progress_callback=progress_callback, **opts_kwargs)
+        return download_one(u, progress_callback=progress_callback, error_callback=error_callback, **opts_kwargs)
 
     if threads <= 1:
         for u in urls:
