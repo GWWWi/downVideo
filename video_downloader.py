@@ -331,6 +331,17 @@ def find_deno_exe() -> str | None:
     import re
     import subprocess
 
+    # 优先使用随包自带的 deno（portable 场景：_internal/deno.exe），
+    # 这样分发包在没装 deno 的机器上也能解 YouTube 的 n 挑战。
+    # 仅在 PyInstaller 冻结运行时检查该路径，避免误伤源码调试模式。
+    if getattr(sys, "frozen", False):
+        bundled = os.path.join(
+            os.path.dirname(sys.executable), "_internal", "deno.exe"
+        )
+        if os.path.isfile(bundled):
+            _DENO_CACHE = bundled
+            return bundled
+
     patterns = (
         # 官方安装器默认位置
         os.path.expanduser("~/.deno/bin/deno"),
