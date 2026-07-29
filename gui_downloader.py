@@ -75,14 +75,17 @@ def _auth_hint(err) -> str:
     e = str(err)
     low = e.lower()
     if "confirm your age" in low or "age-restricted" in low or "sign in to confirm" in low:
-        return ("（该视频为年龄限制内容，需在「Cookie 浏览器」选择已登录 YouTube 的浏览器，"
-                "或提供 Cookie 文件后再试。注意：账号本身需在 YouTube 完成年龄验证）")
+        return ("（该视频为年龄限制内容，需提供已登录且完成年龄验证的 YouTube 账号 Cookie。"
+                "推荐用「Cookie 文件」：用浏览器扩展（如 Cookie-Editor）导出 Netscape 格式 cookies.txt，"
+                "在「Cookie 文件」里选中它、「Cookie 浏览器」留空后重试。"
+                "注意：Windows 上「Cookie 浏览器」常因 Chrome App-Bound Encryption / DPAPI 解密失败，不如 Cookie 文件稳。）")
     if "requested format is not available" in low:
         return ("（所选清晰度在该视频上不可用。请改选「最佳画质」重试；"
-                "若是年龄限制视频，需确保 Cookie 对应的 YouTube 账号已完成年龄验证且 Cookie 未过期，"
+                "若是年龄限制视频，需用「Cookie 文件」提供已完成年龄验证且未过期的 YouTube 账号 Cookie，"
                 "可在能正常观看该视频的浏览器里重新导出 Cookie）")
     if "cookies" in low or "authentication" in low or "login" in low:
-        return "（该视频可能需要登录，请在「Cookie 浏览器」选择已登录的浏览器，或提供 Cookie 文件）"
+        return ("（该视频可能需要登录 / Cookie。推荐用「Cookie 文件」选 Netscape 格式 cookies.txt；"
+                "Windows 上「Cookie 浏览器」易因 DPAPI 解密失败，建议优先用 Cookie 文件、「Cookie 浏览器」留空）")
     return ""
 
 
@@ -347,11 +350,17 @@ class App:
         def cb(url, d):
             self.root.after(0, self._on_progress, url, d)
 
+        def _err_cb(m):
+            # 每个任务失败实时写进日志窗口，并附上年龄限制 / 登录类的针对性提示
+            self.root.after(0, self._append, f"\u274c {m}\n")
+            h = _auth_hint(m)
+            if h:
+                self.root.after(0, self._append, h + "\n")
+
         try:
             results = download_batch(
                 urls, threads=threads, progress_callback=cb,
-                # 每个任务失败实时写进日志窗口（✅/❌ 也回显到日志，便于排查）
-                error_callback=lambda m: self.root.after(0, self._append, f"\u274c {m}\n"),
+                error_callback=_err_cb,
                 output_dir=out, quality=sel,
                 cookies_browser=(browser if browser != "\u65e0" else None),
                 cookies_file=(cookie if cookie else None),
