@@ -29,7 +29,19 @@ echo  spec 文件: %SPEC%
 
 echo.
 echo ============================================================
-echo  [2/4] 正在打包 VideoDownloader（基于 %SPEC%）...
+echo  [2/5] 关闭旧进程并清理旧产物（避免文件被占用导致打包失败）...
+echo ============================================================
+REM 若上一版程序仍在运行，其加载的 .pyd 会被锁定，导致 COLLECT 阶段无法删除 dist；先强制结束
+taskkill /IM VideoDownloader.exe /F >nul 2>&1 && echo  [OK] 已结束正在运行的 VideoDownloader.exe || echo  [提示] 未发现运行中的 VideoDownloader.exe
+timeout /t 1 >nul 2>&1
+if exist "%OUT_DIR%" (
+    rmdir /s /q "%OUT_DIR%" >nul 2>&1
+    echo  [OK] 已清理旧产物目录 %OUT_DIR%
+)
+
+echo.
+echo ============================================================
+echo  [3/5] 正在打包 VideoDownloader（基于 %SPEC%）...
 echo ============================================================
 %PI% -y --noconfirm --clean "%SPEC%"
 if errorlevel 1 (
@@ -39,7 +51,7 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo  [3/4] 校验产物...
+echo  [4/5] 校验产物...
 echo ============================================================
 if not exist "%OUT_DIR%\VideoDownloader.exe" (
     echo [错误] 未找到产物: %OUT_DIR%\VideoDownloader.exe
@@ -49,7 +61,7 @@ echo  [OK] 产物已生成: %OUT_DIR%\VideoDownloader.exe
 
 echo.
 echo ============================================================
-echo  [4/4] 清理 build 中间文件...
+echo  [5/5] 清理 build 中间文件...
 echo ============================================================
 if exist "%BUILD_DIR%" (
     rmdir /s /q "%BUILD_DIR%"

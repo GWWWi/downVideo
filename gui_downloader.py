@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from video_downloader import download_batch, locate_ffmpeg, _human
+from video_downloader import download_batch, locate_ffmpeg, _human, _resolve_cookiefile, build_ydl_opts
 
 try:
     from yt_dlp import YoutubeDL
@@ -68,6 +68,22 @@ def _save_config(data: dict):
 def _trunc(s: str, n: int = 60) -> str:
     s = s or ""
     return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+
+def _auth_hint(err) -> str:
+    """针对 YouTube 年龄限制 / 需要登录 / 格式不可用 的报错，给出中文操作提示。"""
+    e = str(err)
+    low = e.lower()
+    if "confirm your age" in low or "age-restricted" in low or "sign in to confirm" in low:
+        return ("（该视频为年龄限制内容，需在「Cookie 浏览器」选择已登录 YouTube 的浏览器，"
+                "或提供 Cookie 文件后再试。注意：账号本身需在 YouTube 完成年龄验证）")
+    if "requested format is not available" in low:
+        return ("（所选清晰度在该视频上不可用。请改选「最佳画质」重试；"
+                "若是年龄限制视频，需确保 Cookie 对应的 YouTube 账号已完成年龄验证且 Cookie 未过期，"
+                "可在能正常观看该视频的浏览器里重新导出 Cookie）")
+    if "cookies" in low or "authentication" in low or "login" in low:
+        return "（该视频可能需要登录，请在「Cookie 浏览器」选择已登录的浏览器，或提供 Cookie 文件）"
+    return ""
 
 
 class App:
@@ -210,18 +226,24 @@ class App:
 
     def _detect_worker(self, url):
         try:
-            opts = {"quiet": True, "no_warnings": True, "simulate": True}
             browser = self.browser_var.get()
             cookie = self.cookie_var.get()
             proxy = self.proxy_var.get().strip()
-            if browser != "\u65e0":
-                opts["cookiesfrombrowser"] = (browser,)
-            if cookie:
-                opts["cookiefile"] = cookie
             if proxy:
-                opts["proxy"] = proxy
                 os.environ["HTTP_PROXY"] = proxy
                 os.environ["HTTPS_PROXY"] = proxy
+            # 用与下载完全一致的健壮设置（User-Agent / 重试 / nocheckcertificate / socket_timeout），
+            # 并以 best 探测，避免手写极简 opts 缺省 UA 或在 simulate 阶段因所选分辨率过滤而报
+            # "Requested format is not available"。探测目的是列出可选清晰度，故不套用用户所选画质过滤。
+            opts = build_ydl_opts(
+                output_dir=".",
+                quality="best",
+                print_info=True,
+                quiet=True,
+                cookies_browser=(browser if browser != "\u65e0" else None),
+                cookies_file=(cookie if cookie else None),
+                proxy=(proxy or None),
+            )
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             formats = info.get("formats") or []
@@ -242,6 +264,9 @@ class App:
             self.root.after(0, self._append, f"\u2705 检测到分辨率: {', '.join(labels)}\n")
         except Exception as e:
             self.root.after(0, self._append, f"\u274c 检测失败: {e}\n")
+            hint = _auth_hint(e)
+            if hint:
+                self.root.after(0, self._append, hint + "\n")
         finally:
             self.root.after(0, lambda: self.detect_btn.config(state="normal"))
 
@@ -328,10 +353,13 @@ class App:
                 cookies_browser=(browser if browser != "\u65e0" else None),
                 cookies_file=(cookie if cookie else None),
                 proxy=(proxy or None),
-                quiet=False,
+                quiet=True,  # windowed 模式下不向 None 流输出；进度由回调展示，错误写入 downloader.log
             )
         except Exception as e:
             self.root.after(0, self._append, f"\ud83d\udca5 异常: {e}\n")
+            hint = _auth_hint(e)
+            if hint:
+                self.root.after(0, self._append, hint + "\n")
             self.root.after(0, lambda: self.download_btn.config(state="normal"))
             return
 
