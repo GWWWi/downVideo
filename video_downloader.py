@@ -315,6 +315,9 @@ def build_ydl_opts(
     }
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
+    # yt-dlp 默认启用 deno，若当前只有 node 则必须显式指定，否则 n 挑战求解失败
+    if shutil.which("node"):
+        opts["js_runtimes"] = {"node": {}}
     if no_mtime:
         opts["updatetime"] = False
     if cookies_browser:

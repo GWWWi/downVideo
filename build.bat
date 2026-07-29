@@ -11,12 +11,12 @@ set "OUT_DIR=dist\VideoDownloader"
 set "BUILD_DIR=build"
 
 echo ============================================================
-echo  [1/4] 准备打包环境...
+echo  [1/5] 准备打包环境...
 echo ============================================================
 if not exist "%VENV%\Scripts\python.exe" (
     echo [错误] 未找到虚拟环境，请先创建 venv 并安装依赖：
     echo   python -m venv "%VENV%"
-    echo   "%VENV%\Scripts\pip.exe" install pyinstaller yt-dlp imageio-ffmpeg
+    echo   "%VENV%\Scripts\pip.exe" install pyinstaller "yt-dlp[default]" imageio-ffmpeg
     goto :fail
 )
 if exist "%VENV%\Scripts\pyinstaller.exe" (
