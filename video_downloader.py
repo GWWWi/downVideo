@@ -28,9 +28,12 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +49,48 @@ _DENO_CACHE = None   # find_deno_exe 结果缓存
 _JS_RT_CACHE = None  # find_js_runtime 结果缓存：(name, path)
 
 
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+# 画质预设：映射为 yt-dlp 的 format 选择串
+QUALITY_PRESETS = {
+    "best": "bv*+ba/best",
+    "2160p": "bv[height<=2160]+ba/best[height<=2160]",
+    "1440p": "bv[height<=1440]+ba/best[height<=1440]",
+    "1080p": "bv[height<=1080]+ba/best[height<=1080]",
+    "720p": "bv[height<=720]+ba/best[height<=720]",
+    "480p": "bv[height<=480]+ba/best[height<=480]",
+    "360p": "bv[height<=360]+ba/best[height<=360]",
+    "audio": "ba/bestaudio",
+}
+
+PLATFORM_ICON = {
+    "youtube": "▶ YouTube",
+    "twitter": "𝕏 X / Twitter",
+    "pornhub": "🔞 Pornhub",
+}
+
+# 代理会同时注入的环境变量，确保 ffmpeg 子进程（m3u8 分片）也走代理
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+# yt-dlp 判断「所选画质不可用」的错误特征串，用于触发 best 回退
+_FORMAT_UNAVAILABLE_MARKER = "Requested format is not available"
+
+# 用户主动取消时，返回给上层的统一负载标记（GUI 据此区分「取消」与「失败」）
+_CANCELLED_PAYLOAD = "已取消"
+
+
+class DownloadCancelled(Exception):
+    """用户主动取消。
+
+    从 progress hook 里抛出，yt-dlp 会据此中断当前传输并向上传播，是
+    官方支持的取消方式（比杀掉线程安全得多，不会留下写了一半的文件）。
+    """
+
+
+# ---------------------------------------------------------------------------
+# 无控制台（windowed）模式下的安全输出流
+# ---------------------------------------------------------------------------
 def _ensure_streams():
     """windowed（无控制台）模式下 sys.stdout / sys.stderr 为 None，
     任何 .write() 调用都会抛 'NoneType' object has no attribute 'write'。
@@ -101,29 +146,21 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 
 # ---------------------------------------------------------------------------
-# 画质预设：映射为 yt-dlp 的 format 选择串
+# 通用工具函数
 # ---------------------------------------------------------------------------
-QUALITY_PRESETS = {
-    "best": "bv*+ba/best",
-    "2160p": "bv[height<=2160]+ba/best[height<=2160]",
-    "1440p": "bv[height<=1440]+ba/best[height<=1440]",
-    "1080p": "bv[height<=1080]+ba/best[height<=1080]",
-    "720p": "bv[height<=720]+ba/best[height<=720]",
-    "480p": "bv[height<=480]+ba/best[height<=480]",
-    "360p": "bv[height<=360]+ba/best[height<=360]",
-    "audio": "ba/bestaudio",
-}
-
-PLATFORM_ICON = {
-    "youtube": "▶ YouTube",
-    "twitter": "𝕏 X / Twitter",
-    "pornhub": "🔞 Pornhub",
-}
+def _dedupe(urls):
+    """按顺序去重。同一链接粘两次会产生两个任务抢同一份输出文件。"""
+    seen = set()
+    out = []
+    for u in urls:
+        key = (u or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
 
 
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
 def locate_ffmpeg() -> str | None:
     """优先使用 imageio-ffmpeg 自带的 ffmpeg，其次在 PATH 中查找。"""
     if imageio_ffmpeg is not None:
@@ -188,6 +225,36 @@ def _cli_status(url: str, d: dict):
 
 
 # ---------------------------------------------------------------------------
+# 代理环境变量管理：进入/退出下载时注入/恢复，避免残留污染后续任务
+# ---------------------------------------------------------------------------
+class _ProxyEnv:
+    """上下文无关的代理环境注入/恢复。
+
+    进入时保存原值并注入代理，退出时恢复。GUI 里清空代理输入框后，若进程
+    环境仍残留旧代理，后续请求会「偷偷」继续走它，因此必须还原。"""
+
+    def __enter__(self):
+        self._saved = {k: os.environ.get(k) for k in _PROXY_ENV_KEYS}
+        return self
+
+    def __exit__(self, *exc):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return False
+
+    def apply(self, proxy: str | None):
+        """proxy 非空时把代理写入进程环境（供 ffmpeg 子进程使用）。"""
+        if proxy:
+            os.environ["HTTP_PROXY"] = proxy
+            os.environ["HTTPS_PROXY"] = proxy
+            os.environ["http_proxy"] = proxy
+            os.environ["https_proxy"] = proxy
+
+
+# ---------------------------------------------------------------------------
 # Cookie 文件格式兼容：yt-dlp 只认 Netscape 文本格式
 # 浏览器扩展（Cookie-Editor 等）导出的 JSON 需先转换
 # ---------------------------------------------------------------------------
@@ -209,6 +276,14 @@ def _resolve_cookiefile(cookies_file: str | None) -> str | None:
     if not head or head[0] not in "[{":
         return cookies_file  # 非 JSON，按 Netscape 原样处理
 
+    data = _load_cookie_json(cookies_file)
+    if not isinstance(data, list):
+        return cookies_file
+    return _write_netscape_cookies(data) or cookies_file
+
+
+def _load_cookie_json(cookies_file: str) -> object:
+    """读取 Cookie JSON 并归一化为顶层列表；失败或结构不符时返回非 list。"""
     try:
         with open(cookies_file, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
@@ -216,15 +291,17 @@ def _resolve_cookiefile(cookies_file: str | None) -> str | None:
         return cookies_file
     if isinstance(data, dict):
         data = data.get("cookies", data)
-    if not isinstance(data, list):
-        return cookies_file
+    return data if isinstance(data, list) else cookies_file
 
+
+def _write_netscape_cookies(cookies: list) -> str | None:
+    """把 Cookie JSON 列表转换为临时 Netscape 文件，返回路径；无有效条目返回 None。"""
     lines = [
         "# Netscape HTTP Cookie File",
         "# https://curl.se/docs/http-cookies.html",
         "",
     ]
-    for c in data:
+    for c in cookies:
         if not isinstance(c, dict):
             continue
         name = str(c.get("name", ""))
@@ -244,62 +321,39 @@ def _resolve_cookiefile(cookies_file: str | None) -> str | None:
         lines.append("\t".join([domain, flag, path, secure, str(exp), name, value]))
 
     if len(lines) <= 3:
-        return cookies_file  # 没解析出任何有效 cookie
+        return None  # 没解析出任何有效 cookie
 
     try:
         fd, tmp = tempfile.mkstemp(prefix="ydl_cookies_", suffix=".txt", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception:
-        return cookies_file
+        return None
     return tmp
 
 
-def find_node_exe() -> str | None:
-    """定位 node 可执行文件，返回绝对路径（找不到返回 None）。
+def _cleanup_cookiefile(path: str | None):
+    """删除 _resolve_cookiefile 生成的临时 Netscape cookie 文件（仅限系统临时目录内）。"""
+    if not path:
+        return
+    try:
+        if os.path.basename(path).startswith("ydl_cookies_") and os.path.dirname(path) == tempfile.gettempdir():
+            os.remove(path)
+    except Exception:
+        pass
 
-    yt-dlp 新版需要 JS 运行时解 YouTube 的 n/nsig 反爬挑战。不同 node 版本
-    兼容性不同：实测 yt-dlp 2026.7.4 把 node 20.x 标记为 "unsupported"，
-    而 node 22.x 才能正常解出真实格式（否则 "n challenge solving failed"，
-    只能拿到 sb0~sb3 缩略图 → "Requested format is not available"）。
-    因此这里在所有候选里挑**版本最高**的 node，避免挑到不被支持的旧版本。
-    结果带缓存（_NODE_CACHE），避免每次构建下载选项都启动一次 node --version。"""
-    global _NODE_CACHE
-    if _NODE_CACHE is not None:
-        return _NODE_CACHE
-    import glob
-    import re
-    import subprocess
 
-    patterns = (
-        # WorkBuddy 自带 node（22.x，已验证可解 n 挑战）优先纳入候选
-        os.path.expanduser("~/.workbuddy/binaries/node/versions/*/node.exe"),
-        "C:/Users/*/.workbuddy/binaries/node/versions/*/node.exe",
-        "C:/Program Files/nodejs/node.exe",
-        "C:/Program Files (x86)/nodejs/node.exe",
-        os.path.expanduser("~/AppData/Local/Programs/nodejs/node.exe"),
-        os.path.expanduser("~/scoop/apps/nodejs*/current/node.exe"),
-        os.path.expanduser("~/AppData/Roaming/nvm/*/node.exe"),
-    )
-    candidates: list[str] = []
-    which_hit = shutil.which("node")  # 可能返回不受支持的旧 node（如 nvm4w 的 20.x）
-    if which_hit:
-        candidates.append(which_hit)
-    for pat in patterns:
-        candidates.extend(sorted(glob.glob(pat), reverse=True))
+# ---------------------------------------------------------------------------
+# JS 运行时定位：用于解 YouTube 的 n/nsig 反爬挑战
+# ---------------------------------------------------------------------------
+def _pick_highest_version(candidates: list[str]) -> str | None:
+    """在候选可执行文件里逐个 `--version`，返回版本号最高的那个路径（无则 None）。
 
-    # 去重（保留顺序）
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for c in candidates:
-        c = os.path.abspath(c)
-        if c.lower() not in seen:
-            seen.add(c.lower())
-            uniq.append(c)
-
+    node 与 deno 共用此逻辑：yt-dlp 新版会标记旧版本 node 为 unsupported，
+    因此必须在所有候选中挑版本最高者，避免挑到解不出 n 挑战的旧版本。"""
     best = None
     best_ver = (-1, -1, -1)
-    for c in uniq:
+    for c in candidates:
         if not os.path.isfile(c):
             continue
         try:
@@ -315,8 +369,53 @@ def find_node_exe() -> str | None:
         if ver > best_ver:
             best_ver = ver
             best = c
-    _NODE_CACHE = best
     return best
+
+
+def _collect_candidates(patterns, which_name: str) -> list[str]:
+    """汇总 PATH 命中 + 各通配路径下的候选，去重（忽略大小写）后返回。"""
+    candidates = []
+    which_hit = shutil.which(which_name)
+    if which_hit:
+        candidates.append(which_hit)
+    for pat in patterns:
+        candidates.extend(sorted(glob.glob(pat), reverse=True))
+
+    seen = set()
+    uniq = []
+    for c in candidates:
+        c = os.path.abspath(c)
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            uniq.append(c)
+    return uniq
+
+
+def find_node_exe() -> str | None:
+    """定位 node 可执行文件，返回绝对路径（找不到返回 None）。
+
+    yt-dlp 新版需要 JS 运行时解 YouTube 的 n/nsig 反爬挑战。不同 node 版本
+    兼容性不同：实测 yt-dlp 2026.7.4 把 node 20.x 标记为 "unsupported"，
+    而 node 22.x 才能正常解出真实格式（否则 "n challenge solving failed"，
+    只能拿到 sb0~sb3 缩略图 → "Requested format is not available"）。
+    因此这里在所有候选里挑**版本最高**的 node，避免挑到不被支持的旧版本。
+    结果带缓存（_NODE_CACHE），避免每次构建下载选项都启动一次 node --version。"""
+    global _NODE_CACHE
+    if _NODE_CACHE is not None:
+        return _NODE_CACHE
+
+    patterns = (
+        # WorkBuddy 自带 node（22.x，已验证可解 n 挑战）优先纳入候选
+        os.path.expanduser("~/.workbuddy/binaries/node/versions/*/node.exe"),
+        "C:/Users/*/.workbuddy/binaries/node/versions/*/node.exe",
+        "C:/Program Files/nodejs/node.exe",
+        "C:/Program Files (x86)/nodejs/node.exe",
+        os.path.expanduser("~/AppData/Local/Programs/nodejs/node.exe"),
+        os.path.expanduser("~/scoop/apps/nodejs*/current/node.exe"),
+        os.path.expanduser("~/AppData/Roaming/nvm/*/node.exe"),
+    )
+    _NODE_CACHE = _pick_highest_version(_collect_candidates(patterns, "node"))
+    return _NODE_CACHE
 
 
 def find_deno_exe() -> str | None:
@@ -327,9 +426,6 @@ def find_deno_exe() -> str | None:
     global _DENO_CACHE
     if _DENO_CACHE is not None:
         return _DENO_CACHE
-    import glob
-    import re
-    import subprocess
 
     # 优先使用随包自带的 deno（portable 场景：_internal/deno.exe），
     # 这样分发包在没装 deno 的机器上也能解 YouTube 的 n 挑战。
@@ -356,42 +452,8 @@ def find_deno_exe() -> str | None:
         "C:/Program Files/Deno Software/Deno/deno.exe",
         "C:/Program Files/deno/deno.exe",
     )
-    candidates: list[str] = []
-    which_hit = shutil.which("deno")
-    if which_hit:
-        candidates.append(which_hit)
-    for pat in patterns:
-        candidates.extend(sorted(glob.glob(pat), reverse=True))
-
-    # 去重（保留顺序）
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for c in candidates:
-        c = os.path.abspath(c)
-        if c.lower() not in seen:
-            seen.add(c.lower())
-            uniq.append(c)
-
-    best = None
-    best_ver = (-1, -1, -1)
-    for c in uniq:
-        if not os.path.isfile(c):
-            continue
-        try:
-            out = subprocess.run(
-                [c, "--version"], capture_output=True, text=True, timeout=10
-            ).stdout.strip()
-            m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
-            if not m:
-                continue
-            ver = tuple(int(x) for x in m.groups())
-        except Exception:
-            continue
-        if ver > best_ver:
-            best_ver = ver
-            best = c
-    _DENO_CACHE = best
-    return best
+    _DENO_CACHE = _pick_highest_version(_collect_candidates(patterns, "deno"))
+    return _DENO_CACHE
 
 
 def find_js_runtime():
@@ -423,6 +485,13 @@ def ensure_js_runtime_on_path():
             os.environ["PATH"] = rt_dir + os.pathsep + os.environ.get("PATH", "")
 
 
+def _prepend_runtime_to_path(rt) -> None:
+    """把 JS 运行时所在目录加进 PATH 头部（幂等）。"""
+    rt_dir = os.path.dirname(rt[1])
+    if rt_dir.lower() not in os.environ.get("PATH", "").lower():
+        os.environ["PATH"] = rt_dir + os.pathsep + os.environ.get("PATH", "")
+
+
 # ---------------------------------------------------------------------------
 # 构建 yt-dlp 选项
 # ---------------------------------------------------------------------------
@@ -437,15 +506,21 @@ def build_ydl_opts(
     no_playlist: bool = False,
     proxy: str | None = None,
     progress_callback=None,
+    cancel_event=None,
 ) -> dict:
     rt = find_js_runtime()  # 优先 deno，兜底 node；供 yt-dlp 解 YouTube n 挑战
     if rt:
-        rt_dir = os.path.dirname(rt[1])
-        if rt_dir.lower() not in os.environ.get("PATH", "").lower():
-            os.environ["PATH"] = rt_dir + os.pathsep + os.environ.get("PATH", "")
+        _prepend_runtime_to_path(rt)
     ffmpeg = locate_ffmpeg()
     fmt = QUALITY_PRESETS.get(quality, quality)  # 未知串（自定义格式）原样使用
     outtmpl = os.path.join(output_dir, "%(extractor)s", "%(title)s [%(id)s].%(ext)s")
+
+    def _progress_hook(d: dict):
+        # 取消优先于进度上报：hook 是 yt-dlp 唯一保证会被反复调用的地方。
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelled("用户取消")
+        if progress_callback:
+            progress_callback(d)
 
     opts = {
         "format": fmt,
@@ -458,8 +533,9 @@ def build_ydl_opts(
         "retries": 10,
         "fragment_retries": 10,
         "socket_timeout": 30,
-        # 代理型 TLS 中断（SSL UNEXPECTED_EOF）常由中间人证书引起，放宽校验以提升连通性
-        "nocheckcertificate": True,
+        # 只在走代理时放宽证书校验：代理型 TLS 中断（SSL UNEXPECTED_EOF）常由
+        # 中间人证书引起。无代理时保持校验，避免对所有站点无谓降级。
+        "nocheckcertificate": bool(proxy),
         "continuedl": True,
         "noprogress": True,
         "http_headers": {
@@ -469,7 +545,7 @@ def build_ydl_opts(
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         },
-        "progress_hooks": [ProgressReporter(progress_callback).hook],
+        "progress_hooks": [_progress_hook],
     }
     if ffmpeg:
         opts["ffmpeg_location"] = ffmpeg
@@ -503,82 +579,104 @@ def build_ydl_opts(
 # ---------------------------------------------------------------------------
 # 下载逻辑
 # ---------------------------------------------------------------------------
-def download_one(url: str, progress_callback=None, error_callback=None, **opts_kwargs) -> dict:
+def download_one(url: str, progress_callback=None, error_callback=None, cancel_event=None, **opts_kwargs) -> dict:
     """下载单个 URL，返回视频信息字典。失败抛出 RuntimeError。
 
     若所选画质在该视频上不可用（如年龄限制视频格式受限、地区限制），
     会自动回退到 "best"（bv*+ba/best）再尝试一次，最大化下载成功率。
+
+    cancel_event 是一个 threading.Event，置位后会在下一个 progress hook
+    检查点中断下载（抛 DownloadCancelled），不会触发画质回退。
     """
     proxy = opts_kwargs.get("proxy")
-    if proxy:
-        # 同时注入进程环境变量，确保 ffmpeg 子进程（m3u8 分片）也走代理
-        os.environ["HTTP_PROXY"] = proxy
-        os.environ["HTTPS_PROXY"] = proxy
+    quality = opts_kwargs.get("quality", "best")
     # 把 url 一并交给回调，便于上层（GUI）按任务区分进度
     cb = (lambda d: progress_callback(url, d)) if progress_callback else None
-    quality = opts_kwargs.get("quality", "best")
     # 先试用户指定画质；若不可用则回退 best（仅回退一次）
     attempts = [quality, "best"] if quality not in (None, "", "best") else [quality]
     last_err = None
-    for q in attempts:
-        opts = build_ydl_opts(progress_callback=cb, **{**opts_kwargs, "quality": q})
-        simulate = opts.get("simulate", False)
-        with YoutubeDL(opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=not simulate)
-                # 用完即删：自动转换生成的临时 cookie 文件
-                _cleanup_cookiefile(opts.get("cookiefile"))
-                return info or {}
-            except (DownloadError, ExtractorError) as e:
-                _cleanup_cookiefile(opts.get("cookiefile"))
-                msg = str(e)
-                # 画质不可用时，回退 best 再试一次
-                if "Requested format is not available" in msg and q != "best":
-                    last_err = e
-                    continue
-                errmsg = f"下载失败 [{url}]: {e}"
-                # 实时把报错回调出去（GUI 写入日志窗口；CLI 写 stderr）
-                if error_callback:
-                    try:
-                        error_callback(errmsg)
-                    except Exception:
-                        pass
-                raise RuntimeError(errmsg) from e
-    errmsg = f"下载失败 [{url}]: 所选画质不可用且回退 best 仍失败: {last_err}"
-    if error_callback:
+
+    with _ProxyEnv() as penv:
+        penv.apply(proxy)
         try:
-            error_callback(errmsg)
-        except Exception:
-            pass
+            for q in attempts:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelled("用户取消")
+                opts = build_ydl_opts(progress_callback=cb, cancel_event=cancel_event,
+                                      **{**opts_kwargs, "quality": q})
+                simulate = opts.get("simulate", False)
+                try:
+                    info = _run_download(url, opts, simulate)
+                    return info or {}
+                except DownloadCancelled:
+                    raise
+                except (DownloadError, ExtractorError) as e:
+                    msg = str(e)
+                    # 画质不可用时，回退 best 再试一次
+                    if _FORMAT_UNAVAILABLE_MARKER in msg and q != "best":
+                        last_err = e
+                        continue
+                    errmsg = f"下载失败 [{url}]: {e}"
+                    _report_error(error_callback, errmsg)
+                    raise RuntimeError(errmsg) from e
+        finally:
+            _cleanup_cookiefile(opts.get("cookiefile") if "opts" in locals() else None)
+
+    errmsg = f"下载失败 [{url}]: 所选画质不可用且回退 best 仍失败: {last_err}"
+    _report_error(error_callback, errmsg)
     raise RuntimeError(errmsg) from last_err
 
 
-def _cleanup_cookiefile(path: str | None):
-    """删除 _resolve_cookiefile 生成的临时 Netscape cookie 文件（仅限系统临时目录内）。"""
-    if not path:
+def _run_download(url: str, opts: dict, simulate: bool):
+    """执行单次 yt-dlp 提取，成功返回 info 字典；异常原样向上抛。"""
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=not simulate)
+    # 用完即删：自动转换生成的临时 cookie 文件
+    _cleanup_cookiefile(opts.get("cookiefile"))
+    return info
+
+
+def _report_error(error_callback, msg: str):
+    """实时把已拼好的报错消息回调出去（GUI 写日志窗口；CLI 写 stderr）。回调异常静默忽略。"""
+    if not error_callback:
         return
     try:
-        if os.path.basename(path).startswith("ydl_cookies_") and os.path.dirname(path) == tempfile.gettempdir():
-            os.remove(path)
+        error_callback(msg)
     except Exception:
         pass
 
 
-def download_batch(urls, threads: int = 1, progress_callback=None, error_callback=None, **opts_kwargs):
+def download_batch(urls, threads: int = 1, progress_callback=None, error_callback=None,
+                   cancel_event=None, **opts_kwargs):
     """批量下载，返回 [(url, ok, payload)] 列表。单线程逐条，多线程用线程池。
 
     error_callback(msgstr): 每个任务失败时回调，便于 GUI 实时把报错写进日志窗口。
+    cancel_event: 置位后不再启动新任务，并中断进行中的任务。
     """
+    urls = _dedupe(urls)
     results = []
 
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     def _run(u):
-        return download_one(u, progress_callback=progress_callback, error_callback=error_callback, **opts_kwargs)
+        if _cancelled():
+            raise DownloadCancelled("用户取消")
+        return download_one(u, progress_callback=progress_callback,
+                            error_callback=error_callback,
+                            cancel_event=cancel_event, **opts_kwargs)
 
     if threads <= 1:
         for u in urls:
+            if _cancelled():
+                results.append((u, False, _CANCELLED_PAYLOAD))
+                break
             try:
                 info = _run(u)
                 results.append((u, True, info))
+            except DownloadCancelled:
+                results.append((u, False, _CANCELLED_PAYLOAD))
+                break
             except Exception as e:  # 单线程：记录失败继续下一个
                 results.append((u, False, str(e)))
                 sys.stderr.write(f"  ❌ {u}: {e}\n")
@@ -591,6 +689,8 @@ def download_batch(urls, threads: int = 1, progress_callback=None, error_callbac
             try:
                 info = fut.result()
                 results.append((u, True, info))
+            except DownloadCancelled:
+                results.append((u, False, _CANCELLED_PAYLOAD))
             except Exception as e:
                 results.append((u, False, str(e)))
                 sys.stderr.write(f"  ❌ {u}: {e}\n")
@@ -677,6 +777,7 @@ def main(argv=None) -> int:
         urls += _read_urls(args.batch_file)
     if not urls and not sys.stdin.isatty():
         urls += _read_urls_stream(sys.stdin)
+    urls = _dedupe(urls)
     if not urls:
         parser.print_help()
         return 1
